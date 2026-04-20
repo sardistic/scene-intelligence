@@ -562,26 +562,25 @@ def _nms_detections(
 
 
 class _YOLODetector:
-    """Optional YOLOv8 backend. Used when 'ultralytics' is installed.
+    """YOLO11 primary detector via ultralytics.
 
-    Install:  pip install ultralytics
-    On first run the chosen model weights (~6 MB for yolov8n) are downloaded
-    to the ultralytics cache (~/.cache/ultralytics/).
+    On first run the chosen model weights are downloaded to the ultralytics
+    cache (~/.cache/ultralytics/). yolo11m.pt is ~40 MB.
     """
 
     def __init__(
         self,
         *,
-        model_size: str = "n",
-        score_threshold: float = 0.28,
-        max_results: int = 12,
+        model_name: str = "yolo11m.pt",
+        score_threshold: float = 0.25,
+        max_results: int = 20,
     ) -> None:
         from ultralytics import YOLO
         logging.getLogger("ultralytics").setLevel(logging.WARNING)
-        self._model = YOLO(f"yolov8{model_size}.pt")
+        self._model = YOLO(model_name)
         self._threshold = score_threshold
         self._max_results = max_results
-        logging.info("YOLOv8%s object detector ready", model_size)
+        logging.info("YOLO detector ready (%s)", model_name)
 
     def detect(
         self,
@@ -626,9 +625,10 @@ def _try_create_yolo(**kwargs) -> Optional["_YOLODetector"]:
     try:
         return _YOLODetector(**kwargs)
     except ImportError:
+        logging.warning("ultralytics not installed — falling back to EfficientDet. Run: pip install ultralytics")
         return None
     except Exception as exc:
-        logging.debug("YOLOv8 init failed: %s", exc)
+        logging.warning("YOLO init failed (%s) — falling back to EfficientDet", exc)
         return None
 
 
@@ -649,9 +649,9 @@ class SceneObjectDetector:
         self,
         *,
         model_path: Optional[Path] = None,
-        max_results: int = 10,
-        score_threshold: float = 0.28,
-        detect_every: int = 5,
+        max_results: int = 20,
+        score_threshold: float = 0.25,
+        detect_every: int = 3,
     ) -> None:
         self._max_results = max_results
         self._base_threshold = score_threshold
@@ -665,7 +665,11 @@ class SceneObjectDetector:
             [model_path] if model_path
             else [APP_DIR / "efficientdet_lite2.tflite", DEFAULT_MODEL_PATH]
         )
-        self._yolo = _try_create_yolo(score_threshold=score_threshold, max_results=max_results)
+        self._yolo = _try_create_yolo(
+            model_name="yolo11m.pt",
+            score_threshold=score_threshold,
+            max_results=max_results,
+        )
 
     def _resolve_model_path(self) -> Path:
         for candidate in self._model_candidates:

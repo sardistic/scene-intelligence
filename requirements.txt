@@ -2,6 +2,4 @@ mediapipe>=0.10.14
 opencv-python>=4.5
 numpy>=1.21
 protobuf>=4.25,<5
-
-# Optional — install for dramatically better object detection accuracy
-# ultralytics  # pip install ultralytics
+ultralytics>=8.3

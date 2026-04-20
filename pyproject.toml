@@ -13,6 +13,7 @@ dependencies = [
   "opencv-python>=4.5",
   "numpy>=1.21",
   "protobuf>=4.25,<5",
+  "ultralytics>=8.3",
 ]
 
 [project.scripts]

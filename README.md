@@ -111,20 +111,11 @@ Print JSON to stdout without the preview window:
 scene-intelligence --source 0 --stdout-json --no-preview
 ```
 
-## Better Object Detection (optional)
+## Object Detection
 
-By default the app uses **EfficientDet-Lite2** (downloaded automatically on first run, ~7 MB).
+The default detector is **YOLO11m** via [ultralytics](https://github.com/ultralytics/ultralytics) — 51.5 mAP@50-95 across 80 COCO classes. Model weights (~40 MB) are downloaded automatically on first run to `~/.cache/ultralytics/`.
 
-For dramatically better accuracy install [Ultralytics](https://github.com/ultralytics/ultralytics):
-
-```bash
-pip install ultralytics
-# or inside the venv:
-.venv/Scripts/pip install ultralytics   # Windows
-.venv/bin/pip install ultralytics       # macOS / Linux
-```
-
-When `ultralytics` is present the app automatically switches to **YOLOv8n** (80 COCO classes, much higher mAP). The ~6 MB weights download on first run and cache in `~/.cache/ultralytics/`. No config change needed — it just works.
+> **Note:** `ultralytics` requires PyTorch, which is a large download (~2 GB) on a fresh machine. It is a one-time install. If ultralytics is unavailable the app falls back to **EfficientDet-Lite2** automatically.
 
 ## Long-Term Object Memory
 
