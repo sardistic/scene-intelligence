@@ -70,6 +70,11 @@ SPEAKING_WINDOW_FRAMES = 16
 SPEAKING_MEAN_THRESHOLD = 0.038
 SPEAKING_VAR_THRESHOLD = 0.00035
 
+_SIG_BINS = 8
+_SIG_DIM = _SIG_BINS * 3  # 24-float colour histogram
+_SIG_MATCH_THRESHOLD = 0.80
+_MAX_INSTANCES_PER_LABEL = 8
+
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL_PATH = APP_DIR / "efficientdet_lite0.tflite"
 DEFAULT_MEMORY_PATH = APP_DIR / ".scene_memory.json"
@@ -190,6 +195,33 @@ def smooth_palette(
     ]
 
 
+def _compute_roi_signature(frame_bgr: np.ndarray, bbox: tuple[int, int, int, int]) -> list[float]:
+    """24-float BGR colour histogram for a detection ROI."""
+    x, y, w, h = bbox
+    if w < 6 or h < 6 or frame_bgr.size == 0:
+        return []
+    roi = frame_bgr[max(0, y):y + h, max(0, x):x + w]
+    if roi.size == 0:
+        return []
+    small = cv2.resize(roi, (32, 32), interpolation=cv2.INTER_AREA)
+    sig: list[float] = []
+    for ch in range(3):
+        hist = cv2.calcHist([small], [ch], None, [_SIG_BINS], [0.0, 256.0])
+        sig.extend(float(v[0]) for v in hist)
+    total = sum(sig)
+    return [v / total for v in sig] if total > 1e-9 else sig
+
+
+def _signature_similarity(a: list[float], b: list[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(y * y for y in b))
+    denom = norm_a * norm_b
+    return dot / denom if denom > 1e-9 else 0.0
+
+
 class SceneBlobTracker:
     def __init__(
         self,
@@ -273,9 +305,24 @@ class SpeakingDetector:
 
 
 class SceneMemory:
+    """Per-instance persistent memory keyed by (label, appearance signature).
+
+    Storage format per label::
+
+        {
+          "instances": [
+            {"id": 1, "sightings": 42, "first_seen": …, "last_seen": …,
+             "avg_confidence": 0.8, "typical_x": 0.4, "typical_y": 0.5,
+             "typical_area": 0.06, "sig": […24 floats…], "sig_n": 30}
+          ],
+          "next_id": 2
+        }
+    """
     SAVE_INTERVAL_SEC = 30.0
     FAMILIARITY_SATURATE = 80
     MAX_BOOST = 0.35
+    _SIG_EMA = 0.08
+    _ALPHA = 0.06
 
     def __init__(self, memory_file: Path) -> None:
         self.memory_file = memory_file
@@ -287,11 +334,121 @@ class SceneMemory:
     def _load(self) -> None:
         try:
             if self.memory_file.exists():
-                data = json.loads(self.memory_file.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    self._mem = data
+                raw = json.loads(self.memory_file.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    self._mem = self._migrate(raw)
         except Exception:
             self._mem = {}
+
+    @staticmethod
+    def _migrate(data: dict) -> dict:
+        out: dict[str, Any] = {}
+        for label, entry in data.items():
+            if isinstance(entry, dict) and "instances" in entry:
+                out[label] = entry
+            elif isinstance(entry, dict) and "sightings" in entry:
+                out[label] = {
+                    "instances": [{
+                        "id": 1,
+                        "sightings": int(entry.get("sightings", 1)),
+                        "first_seen": float(entry.get("first_seen", time.time())),
+                        "last_seen": float(entry.get("last_seen", time.time())),
+                        "avg_confidence": float(entry.get("avg_confidence", 0.5)),
+                        "typical_x": float(entry.get("typical_x", 0.5)),
+                        "typical_y": 0.5,
+                        "typical_area": 0.0,
+                        "sig": [],
+                        "sig_n": 0,
+                    }],
+                    "next_id": 2,
+                }
+        return out
+
+    def _label_entry(self, label: str) -> dict:
+        if label not in self._mem:
+            self._mem[label] = {"instances": [], "next_id": 1}
+        return self._mem[label]
+
+    def find_instance(self, label: str, sig: list[float], cx: float, cy: float = 0.5) -> Optional[int]:
+        """Return best-matching instance ID without updating memory, or None."""
+        entry = self._mem.get(label)
+        if not entry:
+            return None
+        instances = entry.get("instances", [])
+        if not instances:
+            return None
+
+        if sig:
+            best_id, best_score = None, _SIG_MATCH_THRESHOLD
+            for inst in instances:
+                score = _signature_similarity(sig, inst.get("sig", []))
+                if score > best_score:
+                    best_score, best_id = score, inst["id"]
+            if best_id is not None:
+                return best_id
+
+        # Position fallback — nearest centroid within 0.25 normalised units
+        best_id, best_dist = None, 0.25
+        for inst in instances:
+            d = math.hypot(cx - inst["typical_x"], cy - inst.get("typical_y", 0.5))
+            if d < best_dist:
+                best_dist, best_id = d, inst["id"]
+        return best_id
+
+    def record(
+        self,
+        label: str,
+        confidence: float,
+        center_x: float,
+        *,
+        center_y: float = 0.5,
+        area_ratio: float = 0.0,
+        signature: Optional[list[float]] = None,
+    ) -> int:
+        """Record a sighting. Returns the instance ID assigned."""
+        now_ts = time.time()
+        sig = signature or []
+        label_entry = self._label_entry(label)
+
+        inst_id = self.find_instance(label, sig, center_x, center_y)
+        if inst_id is not None:
+            inst = next(i for i in label_entry["instances"] if i["id"] == inst_id)
+        else:
+            if len(label_entry["instances"]) >= _MAX_INSTANCES_PER_LABEL:
+                label_entry["instances"].sort(key=lambda i: i["last_seen"])
+                label_entry["instances"].pop(0)
+            inst = {
+                "id": label_entry["next_id"],
+                "sightings": 0,
+                "first_seen": now_ts,
+                "last_seen": now_ts,
+                "avg_confidence": float(confidence),
+                "typical_x": float(center_x),
+                "typical_y": float(center_y),
+                "typical_area": float(area_ratio),
+                "sig": list(sig),
+                "sig_n": 1 if sig else 0,
+            }
+            label_entry["instances"].append(inst)
+            label_entry["next_id"] += 1
+
+        a = self._ALPHA
+        inst["sightings"] += 1
+        inst["last_seen"] = now_ts
+        inst["avg_confidence"] = (1 - a) * inst["avg_confidence"] + a * float(confidence)
+        inst["typical_x"] = (1 - a) * inst["typical_x"] + a * float(center_x)
+        inst["typical_y"] = (1 - a) * inst.get("typical_y", center_y) + a * float(center_y)
+        inst["typical_area"] = (1 - a) * inst.get("typical_area", area_ratio) + a * float(area_ratio)
+        if sig:
+            old = inst.get("sig", [])
+            ea = self._SIG_EMA
+            inst["sig"] = (
+                [(1 - ea) * o + ea * s for o, s in zip(old, sig)]
+                if old and len(old) == len(sig) else list(sig)
+            )
+            inst["sig_n"] = inst.get("sig_n", 0) + 1
+        self._dirty = True
+        return int(inst["id"])
 
     def save(self, force: bool = False) -> None:
         if not self._dirty:
@@ -307,47 +464,41 @@ class SceneMemory:
         except Exception:
             pass
 
-    def record(self, label: str, confidence: float, center_x: float) -> None:
-        now_ts = time.time()
-        if label not in self._mem:
-            self._mem[label] = {
-                "sightings": 0,
-                "first_seen": now_ts,
-                "last_seen": now_ts,
-                "avg_confidence": float(confidence),
-                "typical_x": float(center_x),
-            }
-        entry = self._mem[label]
-        entry["sightings"] += 1
-        entry["last_seen"] = now_ts
-        alpha = 0.06
-        entry["avg_confidence"] = (1 - alpha) * entry["avg_confidence"] + alpha * confidence
-        entry["typical_x"] = (1 - alpha) * entry["typical_x"] + alpha * center_x
-        self._dirty = True
-
-    def familiarity(self, label: str) -> float:
+    def _best_instance(self, label: str, instance_id: Optional[int] = None) -> Optional[dict]:
         entry = self._mem.get(label)
-        if entry is None:
+        if not entry:
+            return None
+        instances = entry.get("instances", [])
+        if instance_id is not None:
+            instances = [i for i in instances if i["id"] == instance_id]
+        return max(instances, key=lambda i: i["sightings"]) if instances else None
+
+    def familiarity(self, label: str, instance_id: Optional[int] = None) -> float:
+        inst = self._best_instance(label, instance_id)
+        if inst is None:
             return 0.0
-        return min(1.0, entry["sightings"] / self.FAMILIARITY_SATURATE)
+        return min(1.0, inst["sightings"] / self.FAMILIARITY_SATURATE)
 
-    def boost_confidence(self, label: str, raw: float) -> float:
-        return min(1.0, raw * (1.0 + self.familiarity(label) * self.MAX_BOOST))
+    def boost_confidence(self, label: str, raw: float, instance_id: Optional[int] = None) -> float:
+        return min(1.0, raw * (1.0 + self.familiarity(label, instance_id) * self.MAX_BOOST))
 
-    def effective_threshold(self, label: str, base_threshold: float) -> float:
-        return max(0.18, base_threshold - self.familiarity(label) * 0.12)
+    def effective_threshold(self, label: str, base_threshold: float, instance_id: Optional[int] = None) -> float:
+        return max(0.18, base_threshold - self.familiarity(label, instance_id) * 0.12)
+
+    def instance_label(self, label: str, instance_id: int) -> str:
+        entry = self._mem.get(label)
+        if not entry or len(entry.get("instances", [])) <= 1:
+            return label
+        return f"{label}#{instance_id}"
 
     def recent_labels(self, max_age_sec: float = 300.0) -> list[tuple[str, int]]:
         now_ts = time.time()
-        return sorted(
-            [
-                (label, int(entry["sightings"]))
-                for label, entry in self._mem.items()
-                if (now_ts - entry["last_seen"]) <= max_age_sec
-            ],
-            key=lambda item: self._mem[item[0]]["last_seen"],
-            reverse=True,
-        )
+        results: list[tuple[str, int]] = []
+        for label, entry in self._mem.items():
+            for inst in entry.get("instances", []):
+                if (now_ts - inst["last_seen"]) <= max_age_sec:
+                    results.append((self.instance_label(label, inst["id"]), int(inst["sightings"])))
+        return sorted(results, key=lambda item: item[1], reverse=True)
 
 
 class DetectionBuffer:
@@ -410,8 +561,83 @@ def _nms_detections(
     return kept
 
 
+class _YOLODetector:
+    """Optional YOLOv8 backend. Used when 'ultralytics' is installed.
+
+    Install:  pip install ultralytics
+    On first run the chosen model weights (~6 MB for yolov8n) are downloaded
+    to the ultralytics cache (~/.cache/ultralytics/).
+    """
+
+    def __init__(
+        self,
+        *,
+        model_size: str = "n",
+        score_threshold: float = 0.28,
+        max_results: int = 12,
+    ) -> None:
+        from ultralytics import YOLO
+        logging.getLogger("ultralytics").setLevel(logging.WARNING)
+        self._model = YOLO(f"yolov8{model_size}.pt")
+        self._threshold = score_threshold
+        self._max_results = max_results
+        logging.info("YOLOv8%s object detector ready", model_size)
+
+    def detect(
+        self,
+        frame_bgr: np.ndarray,
+        full_w: int,
+        full_h: int,
+        *,
+        held: bool = False,
+    ) -> list[dict[str, Any]]:
+        results = self._model.predict(frame_bgr, verbose=False, conf=self._threshold)[0]
+        dets: list[dict[str, Any]] = []
+        for box in results.boxes or []:
+            conf = float(box.conf[0])
+            x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
+            x1 = max(0, min(full_w - 1, x1))
+            y1 = max(0, min(full_h - 1, y1))
+            x2 = max(0, min(full_w, x2))
+            y2 = max(0, min(full_h, y2))
+            bw, bh = max(1, x2 - x1), max(1, y2 - y1)
+            cls_idx = int(box.cls[0])
+            label = results.names.get(cls_idx, "object")
+            cx = clip_unit((x1 + bw / 2.0) / max(1, full_w))
+            cy = clip_unit((y1 + bh / 2.0) / max(1, full_h))
+            dets.append({
+                "label": label,
+                "confidence": conf,
+                "bbox": (x1, y1, bw, bh),
+                "center_x": cx,
+                "center_y": cy,
+                "center_x_px": x1 + bw // 2,
+                "center_y_px": y1 + bh // 2,
+                "area_ratio": (bw * bh) / max(1, full_w * full_h),
+                "held": held,
+            })
+        return sorted(dets, key=lambda d: d["confidence"], reverse=True)[: self._max_results]
+
+    def close(self) -> None:
+        pass
+
+
+def _try_create_yolo(**kwargs) -> Optional["_YOLODetector"]:
+    try:
+        return _YOLODetector(**kwargs)
+    except ImportError:
+        return None
+    except Exception as exc:
+        logging.debug("YOLOv8 init failed: %s", exc)
+        return None
+
+
 class SceneObjectDetector:
     _MODEL_URL = (
+        "https://storage.googleapis.com/mediapipe-models/object_detector/"
+        "efficientdet_lite2/float32/1/efficientdet_lite2.tflite"
+    )
+    _MODEL_URL_FALLBACK = (
         "https://storage.googleapis.com/mediapipe-models/object_detector/"
         "efficientdet_lite0/float32/1/efficientdet_lite0.tflite"
     )
@@ -424,7 +650,7 @@ class SceneObjectDetector:
         *,
         model_path: Optional[Path] = None,
         max_results: int = 10,
-        score_threshold: float = 0.30,
+        score_threshold: float = 0.28,
         detect_every: int = 5,
     ) -> None:
         self._max_results = max_results
@@ -435,17 +661,29 @@ class SceneObjectDetector:
         self._init_error: Optional[str] = None
         self._cached: list[dict[str, Any]] = []
         self._frame_counter = 0
-        self._model_candidates = [model_path] if model_path else [DEFAULT_MODEL_PATH]
+        self._model_candidates = (
+            [model_path] if model_path
+            else [APP_DIR / "efficientdet_lite2.tflite", DEFAULT_MODEL_PATH]
+        )
+        self._yolo = _try_create_yolo(score_threshold=score_threshold, max_results=max_results)
 
     def _resolve_model_path(self) -> Path:
         for candidate in self._model_candidates:
             if candidate is not None and candidate.exists():
                 return candidate
-        primary = next(candidate for candidate in self._model_candidates if candidate is not None)
-        primary.parent.mkdir(parents=True, exist_ok=True)
-        logging.info("Downloading EfficientDet-Lite0 model (~5 MB) to %s", primary)
-        urllib.request.urlretrieve(self._MODEL_URL, str(primary))
-        return primary
+        lite2 = APP_DIR / "efficientdet_lite2.tflite"
+        lite2.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            logging.info("Downloading EfficientDet-Lite2 model (~7 MB) to %s", lite2)
+            urllib.request.urlretrieve(self._MODEL_URL, str(lite2))
+            return lite2
+        except Exception:
+            logging.warning("EfficientDet-Lite2 download failed, falling back to Lite0")
+        if DEFAULT_MODEL_PATH.exists():
+            return DEFAULT_MODEL_PATH
+        logging.info("Downloading EfficientDet-Lite0 model (~4 MB) to %s", DEFAULT_MODEL_PATH)
+        urllib.request.urlretrieve(self._MODEL_URL_FALLBACK, str(DEFAULT_MODEL_PATH))
+        return DEFAULT_MODEL_PATH
 
     def _ensure_ready(self) -> bool:
         if self._detector is not None:
@@ -510,6 +748,7 @@ class SceneObjectDetector:
                 "center_y": cy,
                 "center_x_px": fx + fw // 2,
                 "center_y_px": fy + fh // 2,
+                "area_ratio": (fw * fh) / max(1, full_w * full_h),
                 "held": held,
             })
         return out
@@ -523,52 +762,73 @@ class SceneObjectDetector:
         self._frame_counter += 1
         if self._frame_counter % self._detect_every != 0:
             return self._cached
-        if not self._ensure_ready():
-            return self._cached
         try:
             height, width = frame_bgr.shape[:2]
             all_dets: list[dict[str, Any]] = []
-            all_dets.extend(self._run_on_bgr(frame_bgr, width, height))
 
-            if hand_bboxes:
-                for hx, hy, hw, hh in hand_bboxes:
-                    pad_x = int(hw * self._HAND_CROP_PAD)
-                    pad_y = int(hh * self._HAND_CROP_PAD)
-                    rx = max(0, hx - pad_x)
-                    ry = max(0, hy - pad_y)
-                    rx2 = min(width, hx + hw + pad_x)
-                    ry2 = min(height, hy + hh + pad_y)
-                    crop_w, crop_h = rx2 - rx, ry2 - ry
-                    if crop_w < self._MIN_CROP_DIM or crop_h < self._MIN_CROP_DIM:
-                        continue
-                    crop = frame_bgr[ry:ry2, rx:rx2]
-                    longest = max(crop_w, crop_h)
-                    scale = self._HAND_CROP_TARGET / max(1, longest)
-                    if scale > 1.0:
-                        crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
-                    else:
-                        scale = 1.0
-                    all_dets.extend(
-                        self._run_on_bgr(
-                            crop,
-                            width,
-                            height,
-                            offset_x=rx,
-                            offset_y=ry,
-                            scale=scale,
-                            held=True,
+            if self._yolo is not None:
+                all_dets.extend(self._yolo.detect(frame_bgr, width, height))
+                if hand_bboxes:
+                    for hx, hy, hw, hh in hand_bboxes:
+                        pad_x = int(hw * self._HAND_CROP_PAD)
+                        pad_y = int(hh * self._HAND_CROP_PAD)
+                        rx = max(0, hx - pad_x)
+                        ry = max(0, hy - pad_y)
+                        rx2 = min(width, hx + hw + pad_x)
+                        ry2 = min(height, hy + hh + pad_y)
+                        if (rx2 - rx) < self._MIN_CROP_DIM or (ry2 - ry) < self._MIN_CROP_DIM:
+                            continue
+                        crop = frame_bgr[ry:ry2, rx:rx2]
+                        all_dets.extend(self._yolo.detect(crop, width, height, held=True))
+            else:
+                if not self._ensure_ready():
+                    return self._cached
+                all_dets.extend(self._run_on_bgr(frame_bgr, width, height))
+                if hand_bboxes:
+                    for hx, hy, hw, hh in hand_bboxes:
+                        pad_x = int(hw * self._HAND_CROP_PAD)
+                        pad_y = int(hh * self._HAND_CROP_PAD)
+                        rx = max(0, hx - pad_x)
+                        ry = max(0, hy - pad_y)
+                        rx2 = min(width, hx + hw + pad_x)
+                        ry2 = min(height, hy + hh + pad_y)
+                        crop_w, crop_h = rx2 - rx, ry2 - ry
+                        if crop_w < self._MIN_CROP_DIM or crop_h < self._MIN_CROP_DIM:
+                            continue
+                        crop = frame_bgr[ry:ry2, rx:rx2]
+                        longest = max(crop_w, crop_h)
+                        scale = self._HAND_CROP_TARGET / max(1, longest)
+                        if scale > 1.0:
+                            crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+                        else:
+                            scale = 1.0
+                        all_dets.extend(
+                            self._run_on_bgr(crop, width, height, offset_x=rx, offset_y=ry, scale=scale, held=True)
                         )
-                    )
+
+            # Attach appearance signatures
+            for det in all_dets:
+                det["signature"] = _compute_roi_signature(frame_bgr, det["bbox"])
 
             if memory is not None:
                 boosted: list[dict[str, Any]] = []
                 for det in all_dets:
                     label = det["label"]
-                    effective_threshold = memory.effective_threshold(label, self._base_threshold)
-                    boosted_confidence = memory.boost_confidence(label, det["confidence"])
-                    if boosted_confidence >= effective_threshold:
+                    sig = det.get("signature", [])
+                    inst_id = memory.find_instance(label, sig, det["center_x"], det.get("center_y", 0.5))
+                    eff_thresh = memory.effective_threshold(label, self._base_threshold, inst_id)
+                    boosted_conf = memory.boost_confidence(label, det["confidence"], inst_id)
+                    if boosted_conf >= eff_thresh:
                         det = dict(det)
-                        det["confidence"] = boosted_confidence
+                        det["confidence"] = boosted_conf
+                        inst_id = memory.record(
+                            label, boosted_conf, det["center_x"],
+                            center_y=det.get("center_y", 0.5),
+                            area_ratio=det.get("area_ratio", 0.0),
+                            signature=sig,
+                        )
+                        det["instance_id"] = inst_id
+                        det["display_label"] = memory.instance_label(label, inst_id)
                         boosted.append(det)
                 all_dets = boosted
 
@@ -578,6 +838,8 @@ class SceneObjectDetector:
         return self._cached
 
     def close(self) -> None:
+        if self._yolo is not None:
+            self._yolo.close()
         if self._detector is not None:
             try:
                 self._detector.close()
@@ -1457,8 +1719,6 @@ class SceneIntelligenceEngine:
         real_detections = stable_detections if self.settings.scene_object_detection_enabled else []
 
         if self.settings.scene_memory_enabled and real_detections:
-            for det in real_detections:
-                self._scene_memory.record(det["label"], det["confidence"], det["center_x"])
             self._scene_memory.save()
 
         face_bbox = face_state["bbox"] if face_state is not None else None
@@ -1778,10 +2038,11 @@ class SceneIntelligenceEngine:
                     box_color = (0, 220, 255) if held else (255, 220, 60)
                     det_conf = int(round(float(det["confidence"]) * 100))
                     prefix = "held " if held else ""
+                    det_label = det.get("display_label") or det["label"]
                     cv2.rectangle(frame, (dx, dy), (dx + dw, dy + dh), box_color, 1 if not held else 2)
                     cv2.putText(
                         frame,
-                        f"{prefix}{det['label']} {det_conf}%",
+                        f"{prefix}{det_label} {det_conf}%",
                         (dx, max(14, dy - 5)),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.40,
