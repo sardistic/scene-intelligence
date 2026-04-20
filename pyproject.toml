@@ -7,7 +7,7 @@ name = "scene-intelligence"
 version = "0.1.0"
 description = "Portable camera-based scene understanding for webcams, files, and streams."
 readme = "README.md"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.10"
 dependencies = [
   "mediapipe>=0.10.14",
   "opencv-python>=4.5",
