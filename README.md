@@ -37,6 +37,8 @@ https://github.com/sardistic/scene-intelligence/archive/refs/heads/main.zip
 
 That is the quickest out-of-box path.
 
+If the window closes too quickly after an error, use `run-webcam-debug.bat` instead. It keeps the console open and runs with verbose Python output.
+
 If you prefer PowerShell:
 
 ```powershell
