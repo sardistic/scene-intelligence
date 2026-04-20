@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+.scene_memory.json
+scene_state.json
+scene_events.jsonl

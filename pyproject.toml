@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scene-intelligence"
+version = "0.1.0"
+description = "Portable camera-based scene understanding for webcams, files, and streams."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "mediapipe>=0.10.14",
+  "opencv-python>=4.5",
+  "numpy>=1.21",
+  "protobuf>=4.25,<5",
+]
+
+[project.scripts]
+scene-intelligence = "scene_intelligence.app:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+scene_intelligence = ["efficientdet_lite0.tflite"]
