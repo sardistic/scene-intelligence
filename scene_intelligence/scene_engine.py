@@ -1065,6 +1065,7 @@ class _FaceMeshWrapper:
         self._sol = None
         self._landmarker = None
         self._num_faces = max_num_faces
+        self._ts_ms = 0
 
         solutions = _get_mp_solutions()
         if solutions is not None:
@@ -1082,6 +1083,7 @@ class _FaceMeshWrapper:
         self._init_tasks()
 
     def _init_tasks(self):
+        import time as _time
         from mediapipe.tasks.python import vision as mp_vision
         from mediapipe.tasks.python.core import base_options as mp_base
         path = self._TASK_PATH
@@ -1091,16 +1093,20 @@ class _FaceMeshWrapper:
         options = mp_vision.FaceLandmarkerOptions(
             base_options=mp_base.BaseOptions(model_asset_buffer=path.read_bytes()),
             num_faces=self._num_faces,
-            running_mode=mp_vision.RunningMode.IMAGE,
+            running_mode=mp_vision.RunningMode.VIDEO,
         )
         self._landmarker = mp_vision.FaceLandmarker.create_from_options(options)
+        self._ts_ms = int(_time.monotonic() * 1000)
         logging.info("Face Mesh ready (Tasks API)")
 
     def process(self, rgb):
         if self._sol is not None:
             return self._sol.process(rgb)
+        import time as _time
+        ts = max(self._ts_ms + 1, int(_time.monotonic() * 1000))
+        self._ts_ms = ts
         mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        return _adapt_face_result(self._landmarker.detect(mp_img))
+        return _adapt_face_result(self._landmarker.detect_for_video(mp_img, ts))
 
     def close(self):
         for obj in (self._sol, self._landmarker):
@@ -1121,6 +1127,7 @@ class _PoseWrapper:
     def __init__(self, *, min_detection_confidence=0.5, min_tracking_confidence=0.5):
         self._sol = None
         self._landmarker = None
+        self._ts_ms = 0
 
         solutions = _get_mp_solutions()
         if solutions is not None:
@@ -1136,6 +1143,7 @@ class _PoseWrapper:
         self._init_tasks()
 
     def _init_tasks(self):
+        import time as _time
         from mediapipe.tasks.python import vision as mp_vision
         from mediapipe.tasks.python.core import base_options as mp_base
         path = self._TASK_PATH
@@ -1144,16 +1152,20 @@ class _PoseWrapper:
             urllib.request.urlretrieve(self._TASK_URL, str(path))
         options = mp_vision.PoseLandmarkerOptions(
             base_options=mp_base.BaseOptions(model_asset_buffer=path.read_bytes()),
-            running_mode=mp_vision.RunningMode.IMAGE,
+            running_mode=mp_vision.RunningMode.VIDEO,
         )
         self._landmarker = mp_vision.PoseLandmarker.create_from_options(options)
+        self._ts_ms = int(_time.monotonic() * 1000)
         logging.info("Pose ready (Tasks API)")
 
     def process(self, rgb):
         if self._sol is not None:
             return self._sol.process(rgb)
+        import time as _time
+        ts = max(self._ts_ms + 1, int(_time.monotonic() * 1000))
+        self._ts_ms = ts
         mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        return _adapt_pose_result(self._landmarker.detect(mp_img))
+        return _adapt_pose_result(self._landmarker.detect_for_video(mp_img, ts))
 
     def close(self):
         for obj in (self._sol, self._landmarker):
@@ -1176,6 +1188,7 @@ class _HandsWrapper:
         self._sol = None
         self._landmarker = None
         self._max_hands = max_num_hands
+        self._ts_ms = 0
 
         solutions = _get_mp_solutions()
         if solutions is not None:
@@ -1192,6 +1205,7 @@ class _HandsWrapper:
         self._init_tasks()
 
     def _init_tasks(self):
+        import time as _time
         from mediapipe.tasks.python import vision as mp_vision
         from mediapipe.tasks.python.core import base_options as mp_base
         path = self._TASK_PATH
@@ -1201,16 +1215,20 @@ class _HandsWrapper:
         options = mp_vision.HandLandmarkerOptions(
             base_options=mp_base.BaseOptions(model_asset_buffer=path.read_bytes()),
             num_hands=self._max_hands,
-            running_mode=mp_vision.RunningMode.IMAGE,
+            running_mode=mp_vision.RunningMode.VIDEO,
         )
         self._landmarker = mp_vision.HandLandmarker.create_from_options(options)
+        self._ts_ms = int(_time.monotonic() * 1000)
         logging.info("Hands ready (Tasks API)")
 
     def process(self, rgb):
         if self._sol is not None:
             return self._sol.process(rgb)
+        import time as _time
+        ts = max(self._ts_ms + 1, int(_time.monotonic() * 1000))
+        self._ts_ms = ts
         mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        return _adapt_hand_result(self._landmarker.detect(mp_img))
+        return _adapt_hand_result(self._landmarker.detect_for_video(mp_img, ts))
 
     def close(self):
         for obj in (self._sol, self._landmarker):
@@ -1698,8 +1716,8 @@ class SceneIntelligenceEngine:
                 eye_cx = x + w_box // 2
                 eye_cy = y + h_box // 3
                 glance_x = float(face_state["glance_x"])
-                arrow_end = (int(eye_cx + glance_x * 30), eye_cy)
-                cv2.arrowedLine(frame, (eye_cx, eye_cy), arrow_end, (255, 220, 60), 2, tipLength=0.4)
+                arrow_end = (int(eye_cx + glance_x * max(60, w_box // 2)), eye_cy)
+                cv2.arrowedLine(frame, (eye_cx, eye_cy), arrow_end, (255, 220, 60), 2, tipLength=0.35)
 
             if pose_state is not None and self.settings.scene_person_enabled:
                 bx = int(round(float(pose_state["bbox_norm"][0]) * width))
