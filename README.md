@@ -10,7 +10,7 @@ Camera-based scene understanding for webcams, video files, and network streams.
 - face mood, glance, proximity, and speaking cues
 - person / pose cues
 - motion regions and tracked objects
-- optional semantic object detections
+- semantic object detections with **long-term instance memory**
 - JSON output for automation, visualization, or downstream integrations
 
 There is no device-control setup, no API key, and no lighting hardware required.
@@ -21,7 +21,7 @@ https://github.com/sardistic/scene-intelligence/archive/refs/heads/main.zip
 
 ## Requirements
 
-- Python 3.10 or 3.11 recommended
+- Python 3.10+ (including 3.13)
 - A webcam, video file, or stream URL
 - Windows, macOS, or Linux
 
@@ -111,31 +111,54 @@ Print JSON to stdout without the preview window:
 scene-intelligence --source 0 --stdout-json --no-preview
 ```
 
+## Better Object Detection (optional)
+
+By default the app uses **EfficientDet-Lite2** (downloaded automatically on first run, ~7 MB).
+
+For dramatically better accuracy install [Ultralytics](https://github.com/ultralytics/ultralytics):
+
+```bash
+pip install ultralytics
+# or inside the venv:
+.venv/Scripts/pip install ultralytics   # Windows
+.venv/bin/pip install ultralytics       # macOS / Linux
+```
+
+When `ultralytics` is present the app automatically switches to **YOLOv8n** (80 COCO classes, much higher mAP). The ~6 MB weights download on first run and cache in `~/.cache/ultralytics/`. No config change needed — it just works.
+
+## Long-Term Object Memory
+
+The app keeps a persistent memory file (`.scene_memory.json` next to the package) that tracks every object it sees across sessions.
+
+- Each label (cup, person, laptop, …) maintains up to 8 distinct **instances** identified by a colour-histogram appearance fingerprint.
+- The overlay shows instance labels like `cup#1`, `cup#2` when multiple distinct instances of the same class have been seen.
+- Familiar objects get lower detection thresholds and a confidence boost, so things you see regularly are detected more reliably over time.
+- Delete `.scene_memory.json` to reset all memory.
+
 ## What You Get
 
 Each emitted payload includes fields like:
 
-- `summary`
-- `focus_x`
-- `focus_y`
-- `focus_confidence`
-- `focus_spread`
-- `ambient_rgb`
-- `accent_rgb`
-- `scene_energy`
-- `active_signals`
-- `environment`
-- `face`
-- `pose`
-- `motion`
-- `tracked_objects`
-- `detections`
+| Field | Description |
+|---|---|
+| `summary` | Human-readable scene description |
+| `focus_x` / `focus_y` | Normalised attention point (0–1) |
+| `focus_confidence` | How confident the focus estimate is |
+| `ambient_rgb` / `accent_rgb` | Scene colour suggestions |
+| `scene_energy` | Activity level 14–100 |
+| `active_signals` | Which cues are driving focus (face, pose, motion, …) |
+| `environment` | Brightness, warmth, contrast, edge density |
+| `face` | Mood, glance direction, proximity, speaking flag |
+| `pose` | Body lean, arms raised, activity score |
+| `motion` | Dominant motion region |
+| `detections` | Object detections with `display_label`, `instance_id`, `confidence` |
+| `tracked_objects` | Tracked motion blobs with classified labels |
 
 ## Notes
 
-- The bundled EfficientDet model is already included in this repo, so object detection works without a first-run model download.
-- If Face Mesh fails to initialize on a machine, the app will keep running with face-driven cues disabled instead of crashing.
-- The dependency pin for `protobuf<5` is intentional because newer protobuf versions can break MediaPipe Face Mesh on some systems.
+- EfficientDet-Lite2 is downloaded on first run (~7 MB). The bundled Lite0 model is kept as a fallback.
+- Face Mesh, Pose, and Hands all fall back gracefully — the app keeps running with reduced cues if any model fails to init.
+- On first run with a fresh install, three MediaPipe task models are also downloaded (~42 MB total). Subsequent runs are instant.
 
 ## Troubleshooting
 
