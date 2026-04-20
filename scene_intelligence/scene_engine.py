@@ -571,7 +571,7 @@ class _YOLODetector:
     def __init__(
         self,
         *,
-        model_name: str = "yolo11m.pt",
+        model_name: str = "yolo11m-seg.pt",
         score_threshold: float = 0.25,
         max_results: int = 20,
     ) -> None:
@@ -591,8 +591,14 @@ class _YOLODetector:
         held: bool = False,
     ) -> list[dict[str, Any]]:
         results = self._model.predict(frame_bgr, verbose=False, conf=self._threshold)[0]
+        masks_data = None
+        if getattr(results, "masks", None) is not None:
+            try:
+                masks_data = results.masks.data.cpu().numpy()
+            except Exception:
+                pass
         dets: list[dict[str, Any]] = []
-        for box in results.boxes or []:
+        for i, box in enumerate(results.boxes or []):
             conf = float(box.conf[0])
             x1, y1, x2, y2 = (int(v) for v in box.xyxy[0])
             x1 = max(0, min(full_w - 1, x1))
@@ -604,6 +610,28 @@ class _YOLODetector:
             label = results.names.get(cls_idx, "object")
             cx = clip_unit((x1 + bw / 2.0) / max(1, full_w))
             cy = clip_unit((y1 + bh / 2.0) / max(1, full_h))
+            dominant_rgb: Optional[tuple[int, int, int]] = None
+            mask_area_ratio: Optional[float] = None
+            if masks_data is not None and i < len(masks_data):
+                try:
+                    mask = cv2.resize(masks_data[i], (frame_bgr.shape[1], frame_bgr.shape[0]))
+                    mask_bool = mask > 0.5
+                    npx = int(np.sum(mask_bool))
+                    mask_area_ratio = float(npx) / max(1, full_w * full_h)
+                    if npx > 0:
+                        roi = frame_bgr[mask_bool]
+                        dominant_rgb = (
+                            int(np.median(roi[:, 2])),
+                            int(np.median(roi[:, 1])),
+                            int(np.median(roi[:, 0])),
+                        )
+                except Exception:
+                    pass
+            if dominant_rgb is None:
+                cy_pix, cx_pix = y1 + bh // 2, x1 + bw // 2
+                if 0 <= cy_pix < frame_bgr.shape[0] and 0 <= cx_pix < frame_bgr.shape[1]:
+                    b, g, r = frame_bgr[cy_pix, cx_pix]
+                    dominant_rgb = (int(r), int(g), int(b))
             dets.append({
                 "label": label,
                 "confidence": conf,
@@ -613,6 +641,8 @@ class _YOLODetector:
                 "center_x_px": x1 + bw // 2,
                 "center_y_px": y1 + bh // 2,
                 "area_ratio": (bw * bh) / max(1, full_w * full_h),
+                "mask_area_ratio": mask_area_ratio,
+                "dominant_rgb": dominant_rgb,
                 "held": held,
             })
         return sorted(dets, key=lambda d: d["confidence"], reverse=True)[: self._max_results]
@@ -666,7 +696,7 @@ class SceneObjectDetector:
             else [APP_DIR / "efficientdet_lite2.tflite", DEFAULT_MODEL_PATH]
         )
         self._yolo = _try_create_yolo(
-            model_name="yolo11m.pt",
+            model_name="yolo11m-seg.pt",
             score_threshold=score_threshold,
             max_results=max_results,
         )
@@ -850,6 +880,91 @@ class SceneObjectDetector:
             except Exception:
                 pass
             self._detector = None
+
+
+def _angle_3pts(lms, a_idx: int, b_idx: int, c_idx: int) -> Optional[float]:
+    """Angle at b (degrees) between rays b→a and b→c. Returns None if landmarks invisible."""
+    a, b, c = lms.landmark[a_idx], lms.landmark[b_idx], lms.landmark[c_idx]
+    if min(getattr(x, "visibility", 1.0) for x in (a, b, c)) < 0.25:
+        return None
+    ax, ay = float(a.x) - float(b.x), float(a.y) - float(b.y)
+    cx, cy = float(c.x) - float(b.x), float(c.y) - float(b.y)
+    dot = ax * cx + ay * cy
+    mag = math.sqrt(ax ** 2 + ay ** 2) * math.sqrt(cx ** 2 + cy ** 2)
+    return float(math.degrees(math.acos(max(-1.0, min(1.0, dot / max(1e-9, mag)))))) if mag > 1e-9 else None
+
+
+def classify_hand_gesture(hand_landmarks, width: int, height: int) -> dict[str, Any]:
+    """Return gesture label, per-finger extension, wrist position, and orientation."""
+    lms = hand_landmarks.landmark
+    FINGERS = [
+        (4, 2, "thumb"),
+        (8, 6, "index"),
+        (12, 10, "middle"),
+        (16, 14, "ring"),
+        (20, 18, "pinky"),
+    ]
+    finger_extended: dict[str, bool] = {}
+    for tip_idx, pip_idx, name in FINGERS:
+        tip, pip = lms[tip_idx], lms[pip_idx]
+        if name == "thumb":
+            finger_extended[name] = abs(float(tip.x) - float(lms[5].x)) > 0.06
+        else:
+            finger_extended[name] = float(tip.y) < float(pip.y) - 0.01
+    ext = finger_extended
+    n = sum(1 for v in ext.values() if v)
+    if n == 0:
+        gesture = "fist"
+    elif n == 5:
+        gesture = "open_hand"
+    elif ext.get("thumb") and n == 1:
+        gesture = "thumbs_up"
+    elif ext.get("index") and not ext.get("middle") and n <= 2:
+        gesture = "pointing"
+    elif ext.get("index") and ext.get("middle") and not ext.get("ring") and n == 2:
+        gesture = "peace"
+    elif ext.get("thumb") and ext.get("pinky") and n == 2:
+        gesture = "call_me"
+    else:
+        gesture = f"{n}_fingers"
+    wrist = lms[0]
+    mid_mcp = lms[9]
+    dx = float(mid_mcp.x) - float(wrist.x)
+    dy = float(mid_mcp.y) - float(wrist.y)
+    return {
+        "gesture": gesture,
+        "fingers": finger_extended,
+        "extended_count": n,
+        "wrist_x": clip_unit(float(wrist.x)),
+        "wrist_y": clip_unit(float(wrist.y)),
+        "orientation_deg": float(math.degrees(math.atan2(-dy, dx))) % 360,
+    }
+
+
+def compute_optical_flow(prev_gray: np.ndarray, curr_gray: np.ndarray) -> dict[str, Any]:
+    """Farneback dense optical flow: magnitude, dominant direction, coherence, hot zone."""
+    flow = cv2.calcOpticalFlowFarneback(
+        prev_gray, curr_gray, None,
+        pyr_scale=0.5, levels=3, winsize=15,
+        iterations=3, poly_n=5, poly_sigma=1.2, flags=0,
+    )
+    mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+    mean_mag = float(np.mean(mag))
+    if mean_mag < 0.2:
+        return {"magnitude": 0.0, "direction_deg": 0.0, "coherence": 0.0, "active": False}
+    sin_m = float(np.mean(np.sin(ang)))
+    cos_m = float(np.mean(np.cos(ang)))
+    h, w = mag.shape
+    thresh = float(np.percentile(mag, 80))
+    hot_ys, hot_xs = np.where(mag > thresh)
+    return {
+        "magnitude": min(1.0, mean_mag / 6.0),
+        "direction_deg": float(np.degrees(math.atan2(sin_m, cos_m))) % 360,
+        "coherence": float(math.sqrt(sin_m ** 2 + cos_m ** 2)),
+        "hot_cx": float(np.mean(hot_xs)) / max(1, w) if len(hot_xs) else 0.5,
+        "hot_cy": float(np.mean(hot_ys)) / max(1, h) if len(hot_ys) else 0.5,
+        "active": True,
+    }
 
 
 def landmark_xy(landmarks, index: int) -> tuple[float, float]:
@@ -1068,6 +1183,41 @@ def extract_pose_scene_state(pose_landmarks) -> Optional[dict[str, Any]]:
     )
     activity_score = clip_unit(float(visible_count) / float(len(upper_indices)))
 
+    # Joint angles
+    joint_angles: dict[str, float] = {}
+    for ang_name, a, b, c in [
+        ("left_elbow",    11, 13, 15),
+        ("right_elbow",   12, 14, 16),
+        ("left_shoulder", 13, 11, 23),
+        ("right_shoulder",14, 12, 24),
+        ("left_hip",      11, 23, 25),
+        ("right_hip",     12, 24, 26),
+        ("left_knee",     23, 25, 27),
+        ("right_knee",    24, 26, 28),
+    ]:
+        try:
+            v = _angle_3pts(pose_landmarks, a, b, c)
+            if v is not None:
+                joint_angles[ang_name] = round(v, 1)
+        except (IndexError, Exception):
+            pass
+
+    # Key landmark positions
+    key_landmarks: dict[str, dict[str, float]] = {}
+    for pt_name, idx in [
+        ("nose", 0), ("left_shoulder", 11), ("right_shoulder", 12),
+        ("left_elbow", 13), ("right_elbow", 14),
+        ("left_wrist", 15), ("right_wrist", 16),
+        ("left_hip", 23), ("right_hip", 24),
+        ("left_knee", 25), ("right_knee", 26),
+    ]:
+        try:
+            lm = pose_landmarks.landmark[idx]
+            if getattr(lm, "visibility", 0.0) >= visibility_floor:
+                key_landmarks[pt_name] = {"x": round(clip_unit(float(lm.x)), 3), "y": round(clip_unit(float(lm.y)), 3)}
+        except (IndexError, Exception):
+            pass
+
     return {
         "center_x": clip_unit(sum(xs) / len(xs)),
         "center_y": clip_unit(sum(ys) / len(ys)),
@@ -1080,6 +1230,8 @@ def extract_pose_scene_state(pose_landmarks) -> Optional[dict[str, Any]]:
         "body_lean": body_lean,
         "arms_raised": arms_raised,
         "activity_score": activity_score,
+        "joint_angles": joint_angles,
+        "landmarks": key_landmarks,
     }
 
 
@@ -1569,6 +1721,7 @@ class SceneIntelligenceEngine:
         self._scene_smoothed_focus_x: Optional[float] = None
         self._scene_smoothed_focus_y: Optional[float] = None
         self._last_motion_seen_time = 0.0
+        self._prev_gray: Optional[np.ndarray] = None
         self._scene_env_smoothed = {
             "frame_brightness": 0.5,
             "warmth": 0.5,
@@ -1679,13 +1832,23 @@ class SceneIntelligenceEngine:
             pose_result.pose_landmarks if pose_result is not None else None
         )
 
+        # Optical flow
+        gray_small = cv2.resize(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), (320, 180))
+        flow_data: dict[str, Any] = {"active": False, "magnitude": 0.0}
+        if self._prev_gray is not None and self._prev_gray.shape == gray_small.shape:
+            try:
+                flow_data = compute_optical_flow(self._prev_gray, gray_small)
+            except Exception:
+                pass
+        self._prev_gray = gray_small
+
         motion_regions = detect_motion_regions(
             image,
             self._motion_subtractor,
             max_regions=SCENE_OBJECT_MAX_COUNT,
         )
         motion = motion_regions[0] if motion_regions else None
-        if motion is not None:
+        if motion is not None or flow_data.get("active"):
             self._last_motion_seen_time = timestamp_mono
 
         tracked_objects = self._scene_object_tracker.update(
@@ -1698,18 +1861,26 @@ class SceneIntelligenceEngine:
         )
 
         hand_bboxes: list[tuple[int, int, int, int]] = []
-        if self.settings.scene_object_detection_enabled and self._hands is not None:
+        hands_data: list[dict[str, Any]] = []
+        if self._hands is not None:
             hand_result = self._hands.process(rgb)
             if hand_result.multi_hand_landmarks:
                 for hand_landmarks in hand_result.multi_hand_landmarks:
-                    xs = [int(round(landmark.x * width)) for landmark in hand_landmarks.landmark]
-                    ys = [int(round(landmark.y * height)) for landmark in hand_landmarks.landmark]
-                    hand_bboxes.append((
+                    xs = [int(round(lm.x * width)) for lm in hand_landmarks.landmark]
+                    ys = [int(round(lm.y * height)) for lm in hand_landmarks.landmark]
+                    bbox = (
                         max(0, min(xs) - 10),
                         max(0, min(ys) - 10),
                         min(width, max(xs) - min(xs) + 20),
                         min(height, max(ys) - min(ys) + 20),
-                    ))
+                    )
+                    hand_bboxes.append(bbox)
+                    try:
+                        gd = classify_hand_gesture(hand_landmarks, width, height)
+                        gd["bbox"] = bbox
+                        hands_data.append(gd)
+                    except Exception:
+                        hands_data.append({"bbox": bbox, "gesture": "unknown"})
 
         raw_detections: list[dict[str, Any]] = []
         if self.settings.scene_object_detection_enabled:
@@ -1759,6 +1930,10 @@ class SceneIntelligenceEngine:
             motion_weight = 0.8 + min(1.4, float(motion["area_ratio"]) * 12.0 + motion_velocity_norm * 0.6)
             x_candidates.append((float(motion["center_x"]), motion_weight, "motion"))
             y_candidates.append((float(motion["center_y"]), motion_weight, "motion"))
+        if flow_data.get("active") and float(flow_data.get("magnitude", 0.0)) > 0.08:
+            fw = min(1.2, float(flow_data["magnitude"]) * 2.0)
+            x_candidates.append((float(flow_data["hot_cx"]), fw, "flow"))
+            y_candidates.append((float(flow_data["hot_cy"]), fw, "flow"))
         if self.settings.scene_object_enabled and lead_object is not None:
             x_candidates.append((float(lead_object["center_x"]), 0.7, "object"))
             y_candidates.append((float(lead_object["center_y"]), 0.7, "object"))
@@ -1907,6 +2082,8 @@ class SceneIntelligenceEngine:
             "tracked_objects": tracked_objects,
             "detections": real_detections,
             "hand_bboxes": hand_bboxes,
+            "hands": hands_data,
+            "flow": flow_data,
             "raw_focus_x": raw_focus_x,
             "raw_focus_y": raw_focus_y,
             "motion_velocity_px_s": motion_velocity,
@@ -2054,17 +2231,29 @@ class SceneIntelligenceEngine:
                         1,
                     )
 
-                for hx, hy, hw, hh in hand_bboxes:
+                hands_data = result.get("hands") or []
+                for hi, (hx, hy, hw, hh) in enumerate(hand_bboxes):
                     cv2.rectangle(frame, (hx, hy), (hx + hw, hy + hh), (0, 180, 255), 1)
-                    cv2.putText(
-                        frame,
-                        "hand",
-                        (hx, max(14, hy - 5)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.40,
-                        (0, 180, 255),
-                        1,
-                    )
+                    hand_label = "hand"
+                    if hi < len(hands_data):
+                        hand_label = hands_data[hi].get("gesture", "hand")
+                    cv2.putText(frame, hand_label, (hx, max(14, hy - 5)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 180, 255), 1)
+
+        # Flow direction arrow
+        flow = result.get("flow") or {}
+        if flow.get("active") and float(flow.get("magnitude", 0)) > 0.05:
+            mag_norm = float(flow["magnitude"])
+            dir_rad = math.radians(float(flow.get("direction_deg", 0)))
+            arrow_cx, arrow_cy = width - 36, height - 36
+            arrow_len = int(16 + mag_norm * 18)
+            arrow_ex = arrow_cx + int(math.cos(dir_rad) * arrow_len)
+            arrow_ey = arrow_cy - int(math.sin(dir_rad) * arrow_len)
+            coh = float(flow.get("coherence", 0))
+            flow_color = (int(50 + coh * 200), int(200 - coh * 100), 255)
+            cv2.arrowedLine(frame, (arrow_cx, arrow_cy), (arrow_ex, arrow_ey), flow_color, 2, tipLength=0.4)
+            cv2.putText(frame, f"flow {int(mag_norm * 100)}%",
+                        (width - 80, height - 46), cv2.FONT_HERSHEY_SIMPLEX, 0.36, flow_color, 1)
 
         summary = str(result.get("summary", ""))
         cue_text = ", ".join(result.get("active_signals") or []) or "none"
