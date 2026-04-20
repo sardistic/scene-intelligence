@@ -15,6 +15,10 @@ Camera-based scene understanding for webcams, video files, and network streams.
 
 There is no device-control setup, no API key, and no lighting hardware required.
 
+Download ZIP:
+
+https://github.com/sardistic/scene-intelligence/archive/refs/heads/main.zip
+
 ## Requirements
 
 - Python 3.10 or 3.11 recommended
@@ -26,7 +30,8 @@ There is no device-control setup, no API key, and no lighting hardware required.
 ### Windows
 
 1. Install Python 3.11 from https://www.python.org/downloads/ and enable `Add Python to PATH` during install.
-2. Clone this repo or download the ZIP.
+2. Clone this repo or download the ZIP:
+   https://github.com/sardistic/scene-intelligence/archive/refs/heads/main.zip
 3. Double-click `install.bat`.
 4. Double-click `run-webcam.bat`.
 
