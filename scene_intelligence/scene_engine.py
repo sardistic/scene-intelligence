@@ -22,6 +22,20 @@ import mediapipe as mp
 import numpy as np
 
 
+def _get_mp_solutions():
+    """Return the mediapipe solutions module, trying multiple import paths."""
+    try:
+        return mp.solutions
+    except AttributeError:
+        pass
+    try:
+        import mediapipe.python.solutions as _sol
+        return _sol
+    except ImportError:
+        pass
+    return None
+
+
 WHITE = (255, 255, 255)
 CAMERA_IDLE_BASE = (6, 10, 24)
 CAMERA_PALETTE_STOP_COUNT = 5
@@ -994,6 +1008,219 @@ def scene_result_to_payload(result: dict[str, Any], *, source: Optional[str] = N
     return _json_ready(payload)
 
 
+class _LandmarkListAdapter:
+    """Wraps a Tasks-API landmark list so it exposes the .landmark[i] interface."""
+    __slots__ = ("_lms",)
+
+    def __init__(self, landmarks):
+        self._lms = landmarks
+
+    @property
+    def landmark(self):
+        return self._lms
+
+
+def _adapt_face_result(task_result):
+    class _R:
+        pass
+    r = _R()
+    r.multi_face_landmarks = (
+        [_LandmarkListAdapter(lms) for lms in task_result.face_landmarks]
+        if task_result.face_landmarks else None
+    )
+    return r
+
+
+def _adapt_pose_result(task_result):
+    class _R:
+        pass
+    r = _R()
+    r.pose_landmarks = (
+        _LandmarkListAdapter(task_result.pose_landmarks[0])
+        if task_result.pose_landmarks else None
+    )
+    return r
+
+
+def _adapt_hand_result(task_result):
+    class _R:
+        pass
+    r = _R()
+    r.multi_hand_landmarks = (
+        [_LandmarkListAdapter(lms) for lms in task_result.hand_landmarks]
+        if task_result.hand_landmarks else None
+    )
+    return r
+
+
+class _FaceMeshWrapper:
+    _TASK_URL = (
+        "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+        "face_landmarker/float16/1/face_landmarker.task"
+    )
+    _TASK_PATH = APP_DIR / "face_landmarker.task"
+
+    def __init__(self, *, max_num_faces=1, refine_landmarks=True,
+                 min_detection_confidence=0.5, min_tracking_confidence=0.5):
+        self._sol = None
+        self._landmarker = None
+        self._num_faces = max_num_faces
+
+        solutions = _get_mp_solutions()
+        if solutions is not None:
+            try:
+                self._sol = solutions.face_mesh.FaceMesh(
+                    max_num_faces=max_num_faces,
+                    refine_landmarks=refine_landmarks,
+                    min_detection_confidence=min_detection_confidence,
+                    min_tracking_confidence=min_tracking_confidence,
+                )
+                return
+            except Exception:
+                pass
+
+        self._init_tasks()
+
+    def _init_tasks(self):
+        from mediapipe.tasks.python import vision as mp_vision
+        from mediapipe.tasks.python.core import base_options as mp_base
+        path = self._TASK_PATH
+        if not path.exists():
+            logging.info("Downloading %s (~30 MB)...", path.name)
+            urllib.request.urlretrieve(self._TASK_URL, str(path))
+        options = mp_vision.FaceLandmarkerOptions(
+            base_options=mp_base.BaseOptions(model_asset_buffer=path.read_bytes()),
+            num_faces=self._num_faces,
+            running_mode=mp_vision.RunningMode.IMAGE,
+        )
+        self._landmarker = mp_vision.FaceLandmarker.create_from_options(options)
+        logging.info("Face Mesh ready (Tasks API)")
+
+    def process(self, rgb):
+        if self._sol is not None:
+            return self._sol.process(rgb)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        return _adapt_face_result(self._landmarker.detect(mp_img))
+
+    def close(self):
+        for obj in (self._sol, self._landmarker):
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+
+
+class _PoseWrapper:
+    _TASK_URL = (
+        "https://storage.googleapis.com/mediapipe-models/pose_landmarker/"
+        "pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
+    )
+    _TASK_PATH = APP_DIR / "pose_landmarker_lite.task"
+
+    def __init__(self, *, min_detection_confidence=0.5, min_tracking_confidence=0.5):
+        self._sol = None
+        self._landmarker = None
+
+        solutions = _get_mp_solutions()
+        if solutions is not None:
+            try:
+                self._sol = solutions.pose.Pose(
+                    min_detection_confidence=min_detection_confidence,
+                    min_tracking_confidence=min_tracking_confidence,
+                )
+                return
+            except Exception:
+                pass
+
+        self._init_tasks()
+
+    def _init_tasks(self):
+        from mediapipe.tasks.python import vision as mp_vision
+        from mediapipe.tasks.python.core import base_options as mp_base
+        path = self._TASK_PATH
+        if not path.exists():
+            logging.info("Downloading %s (~3 MB)...", path.name)
+            urllib.request.urlretrieve(self._TASK_URL, str(path))
+        options = mp_vision.PoseLandmarkerOptions(
+            base_options=mp_base.BaseOptions(model_asset_buffer=path.read_bytes()),
+            running_mode=mp_vision.RunningMode.IMAGE,
+        )
+        self._landmarker = mp_vision.PoseLandmarker.create_from_options(options)
+        logging.info("Pose ready (Tasks API)")
+
+    def process(self, rgb):
+        if self._sol is not None:
+            return self._sol.process(rgb)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        return _adapt_pose_result(self._landmarker.detect(mp_img))
+
+    def close(self):
+        for obj in (self._sol, self._landmarker):
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+
+
+class _HandsWrapper:
+    _TASK_URL = (
+        "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+        "hand_landmarker/float16/1/hand_landmarker.task"
+    )
+    _TASK_PATH = APP_DIR / "hand_landmarker.task"
+
+    def __init__(self, *, min_detection_confidence=0.6, min_tracking_confidence=0.5,
+                 max_num_hands=2):
+        self._sol = None
+        self._landmarker = None
+        self._max_hands = max_num_hands
+
+        solutions = _get_mp_solutions()
+        if solutions is not None:
+            try:
+                self._sol = solutions.hands.Hands(
+                    min_detection_confidence=min_detection_confidence,
+                    min_tracking_confidence=min_tracking_confidence,
+                    max_num_hands=max_num_hands,
+                )
+                return
+            except Exception:
+                pass
+
+        self._init_tasks()
+
+    def _init_tasks(self):
+        from mediapipe.tasks.python import vision as mp_vision
+        from mediapipe.tasks.python.core import base_options as mp_base
+        path = self._TASK_PATH
+        if not path.exists():
+            logging.info("Downloading %s (~9 MB)...", path.name)
+            urllib.request.urlretrieve(self._TASK_URL, str(path))
+        options = mp_vision.HandLandmarkerOptions(
+            base_options=mp_base.BaseOptions(model_asset_buffer=path.read_bytes()),
+            num_hands=self._max_hands,
+            running_mode=mp_vision.RunningMode.IMAGE,
+        )
+        self._landmarker = mp_vision.HandLandmarker.create_from_options(options)
+        logging.info("Hands ready (Tasks API)")
+
+    def process(self, rgb):
+        if self._sol is not None:
+            return self._sol.process(rgb)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        return _adapt_hand_result(self._landmarker.detect(mp_img))
+
+    def close(self):
+        for obj in (self._sol, self._landmarker):
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+
+
 def _format_solution_init_error(solution_name: str, exc: Exception) -> str:
     protobuf_version = "unknown"
     try:
@@ -1020,7 +1247,7 @@ class SceneIntelligenceEngine:
         self._runtime_warnings: list[str] = []
         self._face_mesh = self._safe_create_solution(
             "Face Mesh",
-            lambda: mp.solutions.face_mesh.FaceMesh(
+            lambda: _FaceMeshWrapper(
                 max_num_faces=1,
                 refine_landmarks=True,
                 min_detection_confidence=0.5,
@@ -1029,14 +1256,14 @@ class SceneIntelligenceEngine:
         )
         self._pose = self._safe_create_solution(
             "Pose",
-            lambda: mp.solutions.pose.Pose(
+            lambda: _PoseWrapper(
                 min_detection_confidence=0.5,
                 min_tracking_confidence=0.5,
             ),
         )
         self._hands = self._safe_create_solution(
             "Hands",
-            lambda: mp.solutions.hands.Hands(
+            lambda: _HandsWrapper(
                 min_detection_confidence=0.6,
                 min_tracking_confidence=0.5,
                 max_num_hands=2,
